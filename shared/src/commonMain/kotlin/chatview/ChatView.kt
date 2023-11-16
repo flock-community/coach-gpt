@@ -46,10 +46,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.aallam.openai.api.chat.Tool
 import domain.Author
 import domain.Message.*
 import general.Colors
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -62,6 +65,29 @@ import store.createStore
 
 fun TextMessage.isMe() = author is Author.Me
 
+
+@Composable
+fun ToolCallMessageCard(message: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp, 10.dp, 10.dp, 10.dp))
+            .background(Color.LightGray)
+            .padding(5.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = message,
+            style = MaterialTheme.typography.body1.copy(
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 0.sp,
+                fontSize = 14.sp
+            ),
+            color = Color.Black,
+            textAlign = TextAlign.Center
+        )
+    }
+}
 
 @Composable
 fun FunctionMessageCard(message: FunctionMessage) {
@@ -157,6 +183,7 @@ fun TextMessageCard(message: TextMessage) {
 }
 
 
+@OptIn(DelicateCoroutinesApi::class)
 @Composable
 fun ChatView() {
 
@@ -201,17 +228,21 @@ fun ChatView() {
                     items(chatState.messages, key = { when(it) {
                         is FunctionMessage -> it.id
                         is TextMessage -> it.text
+                        is ToolCallMessage -> (0..1000000000).random()
                     } }) {
                         when(it) {
                             is FunctionMessage -> FunctionMessageCard(it)
                             is TextMessage -> TextMessageCard(it)
+                            is ToolCallMessage -> ToolCallMessageCard("Executing action...")
                         }
 
                     }
                 }
             }
             SendMessage { text ->
-                store.send(Action.SendMessage(TextMessage(text, Author.Me)))
+                GlobalScope.launch {
+                    store.send(Action.SendMessage(TextMessage(text, Author.Me)))
+                }
             }
         }
     }
@@ -228,9 +259,11 @@ fun GoalBar(store: Store) {
     ) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             AppBarButton("goal.png", goalState.goals.size) {
-                //store.send(Action.AddGoal(Goal("1", "Goal 1", "Goal 1 description")))
+                println("Clicked on goals")
             }
-            AppBarButton("schedule.png", 0) {}
+            AppBarButton("schedule.png", goalState.followUps.size) {
+                println("Clicked on follow ups")
+            }
         }
     }
     Divider(Modifier.fillMaxWidth().height(1.dp), Color.White)

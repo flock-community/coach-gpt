@@ -7,6 +7,10 @@ import com.aallam.openai.api.chat.ChatMessage
 import com.aallam.openai.api.chat.ChatRole
 import com.aallam.openai.api.chat.FunctionCall
 import com.aallam.openai.api.chat.FunctionMode
+import com.aallam.openai.api.chat.ToolCall
+import com.aallam.openai.api.chat.ToolChoice
+import com.aallam.openai.api.chat.ToolId
+import com.aallam.openai.api.chat.toolCall
 import com.aallam.openai.api.logging.LogLevel
 import com.aallam.openai.api.model.ModelId
 import com.aallam.openai.client.LoggingConfig
@@ -19,6 +23,7 @@ import domain.Message
 import domain.Message.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.consumeAsFlow
@@ -26,14 +31,19 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlin.random.Random
-import kotlin.reflect.KFunction1
+import kotlin.reflect.KFunction3
 
 
 sealed interface Action {
     data class SendMessage(val message: TextMessage) : Action
     data class ReceiveResponse(val content: String) : Action
-    data class AddGoal(val goal: Goal) : Action
-    data class AddFollowUp(val followUp: FollowUp) : Action
+    data class AddToolCall(val toolCall: ChatMessage) : Action
+    data class AddGoal(val goal: Goal, val functionName: String, val functionId: ToolId) : Action
+    data class AddFollowUp(
+        val followUp: FollowUp,
+        val functionName: String,
+        val functionId: ToolId
+    ) : Action
 }
 
 data class ChatState(
@@ -49,11 +59,12 @@ data class ChatState(
 )
 
 data class GoalState(
-    val goals: List<Goal> = emptyList<Goal>()
+    val goals: List<Goal> = emptyList(),
+    val followUps: List<FollowUp> = emptyList()
 )
 
 interface Store {
-    fun send(action: Action)
+    suspend fun send(action: Action)
     val chatStateFlow: StateFlow<ChatState>
     val goalStateFlow: StateFlow<GoalState>
     val state get() = chatStateFlow.value
@@ -66,6 +77,10 @@ fun chatReducer(chatState: ChatState, message: Message): ChatState = chatState.c
 
 fun goalReducer(goalState: GoalState, goal: Goal): GoalState = goalState.copy(
     goals = (goalState.goals + goal)
+)
+
+fun followUpReducer(goalState: GoalState, followUp: FollowUp): GoalState = goalState.copy(
+    followUps = (goalState.followUps + followUp)
 )
 
 fun CoroutineScope.createStore(): Store {
@@ -97,19 +112,38 @@ fun CoroutineScope.createStore(): Store {
                             )
                         }
 
+                        is Action.AddToolCall -> {
+                            mutableChatStateFlow.value = chatReducer(
+                                state,
+                                ToolCallMessage(action.toolCall)
+                            )
+                        }
+
                         is Action.AddGoal -> {
                             mutableGoalStateFlow.value = goalReducer(goalState, action.goal)
                             mutableChatStateFlow.value = chatReducer(
                                 state,
-                                FunctionMessage(random.nextInt().toString(), "Added a goal: '${action.goal.name}' - '${action.goal.description}'", Functions.addOrUpdateGoal.name)
-                            )
+                                FunctionMessage(
+                                    random.nextInt().toString(),
+                                    "Added a goal: '${action.goal.name}' - '${action.goal.description}'",
+                                    action.functionName,
+                                    action.functionId.id
+                                ),
+
+                                )
                             sendMessagesToGPT()
                         }
 
                         is Action.AddFollowUp -> {
+                            mutableGoalStateFlow.value = followUpReducer(goalState, action.followUp)
                             mutableChatStateFlow.value = chatReducer(
                                 state,
-                                FunctionMessage(random.nextInt().toString(), "Added a follow-up after '${action.followUp.after}' from now", Functions.addOrUpdateGoal.name)
+                                FunctionMessage(
+                                    random.nextInt().toString(),
+                                    "Added a follow-up after '${action.followUp.after}' from now",
+                                    action.functionName,
+                                    action.functionId.id
+                                )
                             )
                             sendMessagesToGPT()
                         }
@@ -121,19 +155,27 @@ fun CoroutineScope.createStore(): Store {
         private suspend fun sendMessagesToGPT() {
             val message =
                 openAI.chatCompletion(generateRequest(state.messages)).choices.first().message
+
             message.content?.let {
                 send(Action.ReceiveResponse(it))
             }
 
-            message.functionCall?.let {
-                send(it.execute())
+            message.toolCalls?.let {
+                send(Action.AddToolCall(message))
+
+                // TODO The order of messages is not guaranteed, the AddToolCall needs to be exucuted before
+                //delay(1000)
+                it.forEach { toolCall ->
+                    send(toolCall.execute())
+                }
             }
+
         }
 
-        override fun send(action: Action) {
+        override suspend fun send(action: Action) {
             launch {
                 channel.send(action)
-            }
+            }.join()
         }
 
 
@@ -142,33 +184,34 @@ fun CoroutineScope.createStore(): Store {
     }
 }
 
-private val availableFunctions: Map<String, KFunction1<JsonObject, Action>> = mapOf(
-    Functions.addOrUpdateGoal.name to ::addOrUpdateGoal,
-    Functions.scheduleFollowupMeeting.name to ::scheduleFollowUp,
+private val availableFunctions: Map<String, KFunction3<JsonObject, String, ToolId, Action>> = mapOf(
+    Tools.addOrUpdateGoal.function.name to ::addOrUpdateGoal,
+    Tools.scheduleFollowupMeeting.function.name to ::scheduleFollowUp,
 )
 
-private fun addOrUpdateGoal(args: JsonObject): Action {
+private fun addOrUpdateGoal(args: JsonObject, functionName: String, functionId: ToolId): Action {
 
     val id = args["goalId"]?.jsonPrimitive?.content ?: error("id not found")
     val name = args["goalName"]?.jsonPrimitive?.content ?: error("name not found")
     val description =
         args["goalDescription"]?.jsonPrimitive?.content ?: error("description not found")
 
-    return Action.AddGoal(Goal(id, name, description))
+    return Action.AddGoal(Goal(id, name, description), functionName, functionId)
 }
 
-private fun scheduleFollowUp(args: JsonObject): Action {
+private fun scheduleFollowUp(args: JsonObject, functionName: String, functionId: ToolId): Action {
 
     val followUpAfter =
         args["followUpAfter"]?.jsonPrimitive?.content ?: error("followUpAfter not found")
 
-    return Action.AddFollowUp(FollowUp(followUpAfter))
+    return Action.AddFollowUp(FollowUp(followUpAfter), functionName, functionId)
 }
 
-private fun FunctionCall.execute(): Action {
-    val functionToCall = availableFunctions[name] ?: error("Function $name not found")
-    val functionArgs = argumentsAsJson()
-    return functionToCall(functionArgs)
+private fun ToolCall.execute(): Action {
+    val functionToCall =
+        availableFunctions[function.name] ?: error("Function ${function.name} not found")
+    val functionArgs = function.argumentsAsJson()
+    return functionToCall(functionArgs, function.name, id)
 }
 
 fun generateRequest(messages: List<Message>): ChatCompletionRequest {
@@ -181,22 +224,34 @@ fun generateRequest(messages: List<Message>): ChatCompletionRequest {
             )
         ) + messages.map {
             ChatMessage(
+                toolCallId = when (it) {
+                    is FunctionMessage -> ToolId(it.toolCallId)
+                    is TextMessage -> null
+                    is ToolCallMessage -> it.toolCall.toolCallId
+                },
                 role = when (it) {
-                    is FunctionMessage -> ChatRole.Function
+                    is FunctionMessage -> ChatRole.Tool
                     is TextMessage -> if (it.isMe()) ChatRole.User else ChatRole.System
+                    is ToolCallMessage -> it.toolCall.role
                 },
                 content = when (it) {
                     is FunctionMessage -> it.text
                     is TextMessage -> it.text
+                    is ToolCallMessage -> it.toolCall.content
                 },
                 name = when (it) {
                     is FunctionMessage -> it.functionName
                     is TextMessage -> null
-                }
+                    is ToolCallMessage -> it.toolCall.name
+                },
+                toolCalls = when (it) {
+                    is ToolCallMessage -> it.toolCall.toolCalls
+                    else -> null
+                },
             )
         },
-        functions = listOf(Functions.addOrUpdateGoal, Functions.scheduleFollowupMeeting),
-        functionCall = FunctionMode.Auto
+        tools = listOf(Tools.addOrUpdateGoal, Tools.scheduleFollowupMeeting),
+        toolChoice = ToolChoice.Auto
     )
 
     return chatCompletionRequest

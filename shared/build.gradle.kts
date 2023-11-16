@@ -28,7 +28,7 @@ kotlin {
                 @OptIn(org.jetbrains.compose.ExperimentalComposeLibrary::class)
                 implementation(compose.components.resources)
 
-                implementation("com.aallam.openai:openai-client:3.5.1")
+                implementation("com.aallam.openai:openai-client:3.6.0-SNAPSHOT")
 
                 api("com.arkivanov.decompose:decompose:2.2.0-compose-experimental-alpha02")
                 api("com.arkivanov.decompose:extensions-compose-jetbrains:2.2.0-compose-experimental-alpha02")
